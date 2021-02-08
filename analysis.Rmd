@@ -1,0 +1,1257 @@
+---
+title: "Capital One AirBnB Investment Analysis"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: 
+    citation_package: natbib
+    keep_tex: true
+    fig_caption: true
+    #latex_engine: pdflatex
+    #template: ~/Dropbox/miscelanea/svm-r-markdown-templates/svm-latex-ms.tex
+author: Tolu Omotunde
+abstract: " As a part of this assignment, a data product was built to assist a real estate company to understand which zip codes are profitable for short term rentals within New York City.                                                              "
+date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 11pt
+highlighter : highlight.js
+#always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+#rm(list=ls())
+pkgs <- c(
+  "data.table","base", "R.utils", "readxl", "USA.county.data", "noncensus", "plyr", "cowplot",
+  "dplyr","ggplot2","tidyr","naniar", "hrbrthemes", "xts", "reshape2", "tidyverse", "caret",
+  "knitr", "naniar", "GGally","Matrix","plotly","maps", "zoo", "matrixStats", "kableExtra",
+  "ISLR", "tree", "randomForest", "rstatix", "ggpubr", "broom", "sf", "viridis","ggpubr", "maps",
+  "DataExplorer", "psych", "outliers", "webshot", "caret", "gridExtra", "glmnet"
+  )
+
+for (pkg in pkgs) {
+  if (!(pkg %in% installed.packages()[, "Package"])) {
+    install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+data(zip_codes)
+data(USA_county_data)
+webshot::install_phantomjs()
+
+source("Helper_Files/ggbiplot.r") 
+source("Helper_Files/ggscreeplot.r") 
+source("Helper_Files/preprocess.R")
+```
+
+
+> Datasets:
+
+- Cost Data - Estimate of value for two-bedroom properties provided by Zillow.      
+- Revenue Data - AirBnB Data Set with relevant short term rental information.
+- US County Level Socio-Economic Data - Gotten from USA.county.data package in R created by  Emil W. Kirkegaard [link](https://www.rdocumentation.org/packages/USA.county.data)
+- US Zip Code Data - Gotten from the zipcode package, it contains a database of city, state, latitude, and longitude information for U.S. ZIP codes from the CivicSpace Database (August 2004) augmented by Daniel Coven [link](https://www.rdocumentation.org/packages/zipcode)
+
+> Data Importation and Preprocessing
+
+```{r, results='hide', message=FALSE, warning=FALSE, echo=TRUE}
+## Download AirBnB listings dataset
+url <- "http://data.insideairbnb.com/united-states/ny/new-york-city/2019-07-08/data/listings.csv.gz "
+wd <- getwd()
+wd_raw_data <- paste(wd,"Raw_Data", sep="/")
+downloaded_file_name_zip <- paste(wd_raw_data, "listings.csv.gz",sep="/")
+downloaded_file_name_unzip <- paste(wd_raw_data, "listings.csv",sep="/")
+if(!file.exists(downloaded_file_name_unzip)) {
+    download.file(url, downloaded_file_name_zip)
+    gunzip(downloaded_file_name_zip, remove=TRUE)
+}
+
+## Load AirBnB data and Zillow data
+airbnb_df <- read.csv(file.path(wd_raw_data, "listings.csv"),na.strings=c(""," ","NA"))
+zillow_df <- read_excel(file.path(wd_raw_data,"Zip_Zhvi_2bedroom_2021.xlsx"))
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+##### Preprocess zillow dataset
+
+Zillow dates columns are imported in excel numeric formats so it needs to be converted to R date format. The data is also filtered to represent the state of New York
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# Get vector of all the names of the date columns
+date_columns <- names(zillow_df)[8:ncol(zillow_df)]
+
+# Change the date the date columns from excel numeric to R date type
+formatted_date_columns <- format(
+    as.Date(
+        as.integer(date_columns), 
+        origin = "1899-12-30"
+        ),
+    format="%Y-%m"
+    )
+
+# Rename the date columns with the formatted dates and RegionName to ZipCode
+names(zillow_df)[8:ncol(zillow_df)] <- formatted_date_columns
+zillow_df <- zillow_df %>% rename(ZipCode = RegionName)
+
+# Subset datapoints belonging to the state of New york 
+ny_zillow_df <- subset(zillow_df, State=="NY")
+ny_zillow_df_dim = dim(ny_zillow_df)
+
+# Visualize the data
+pretty_print_table(head(ny_zillow_df))
+
+```
+The cost data contains cost data for `r ny_zillow_df_dim[1]` counties
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Compute percentage of missing data**
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# Compute number of missing data 
+zillowMissingValDf <- calcMissingRowPerc(ny_zillow_df)
+pretty_print_table(zillowMissingValDf)
+```
+
+The filtered New York zillow data has quarterly data from 1996 to 2017 and the 1996 to 2010 data has over 10% of missing values which needs to be imputed or dropped in downstream analysis. Also 1996 to 2017 quarterly data is a wide range so we can further filter down into a smaller time window. Cost price across every year between 1996-2017 is calculated and tabulated in a different table for analysis. The median is used as a summary statistic as opposed to the mean to guard against large outlier values (2008 Recession/Housing Price crash) - which may lead to flawed assumptions.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**How is it Achieved?**
+- Account for Median Cost price across Individual years starting 1996 to 2017 tabulated into different table.
+- Analyze the median Cost price trends( 2 and 5 Years) across different regionNames/County for plausible pattern.
+- Make assumptions based on these trends to calculate a singular Median Cost value across various Zip codes.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+ny_date_zillow_df <- ny_zillow_df[8:ncol(ny_zillow_df)]
+#Creating a list of the years
+yearList <- as.character(as.list(unique(year(as.yearmon(names(ny_date_zillow_df))))))
+
+medianYears <- data.frame()
+for (i in yearList) {
+  year <- i
+  medianYearCol <- ny_zillow_df %>% select(starts_with(i), ZipCode) %>%
+    mutate(Median = matrixStats::rowMedians(as.matrix(select(., -matches(" ZipCode")))),na.rm=T)
+    medianYearCol <- medianYearCol %>% select( ZipCode,Median)
+    medianYearCol$year<- rep(year, nrow(medianYearCol))
+    medianYears<-rbind(medianYears,medianYearCol)
+}
+pretty_print_table(medianYears)
+```
+
+
+
+**Median Price Change Over 5 Years**
+Upper half(Orange) of line graph highlights regionNames with significant increase in the median cost price. With RegionName = 10003, 10013 & 10011 median cost price increasing by 0.5 Millionn in a matter of 5 years (2013-2017).
+Lower half of the plot sees little or no increase. In further sections, each zipcode will further analyzed to reason out these trends.
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Median Price Change Over 2 Years**
+Growth/Increase in median cost price measured for recent 2 consecutive years (2016,2017) shares a different story. The market has been dry with little or no fluctuation. Median Cost for regionName - 10003 which had an upward trend for over 4-5 years (2013-2016) has dropped by 0.1 Million. Rest of the regionNames have little or no increase.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+endYear <- as.numeric(yearList[length(yearList)])
+medianPriceAll1 <-
+  medianYears %>% filter(year > (endYear - 5)) %>% mutate(ZipCode=as.factor(ZipCode)) %>%
+    ggplot(aes(
+      x = year,
+      y = Median/1e6,
+      group = ZipCode,
+      colour = ZipCode
+      )) + geom_line() + geom_point() + 
+      scale_y_continuous(labels = scales::comma) + 
+      labs(
+        x="Year", 
+        y="Home Value in Millions($)", 
+        title = "Median Price Across the Years"
+        )
+fig1 <- ggplotly(medianPriceAll1)
+
+medianPriceAll2 <-
+  medianYears %>% filter(year > (endYear - 2)) %>% mutate(ZipCode=as.factor(ZipCode)) %>%
+    ggplot(aes(
+      x = year,
+      y = Median/1e6,
+      group = ZipCode,
+      colour = ZipCode
+      )) + geom_line() + geom_point() + 
+      scale_y_continuous(labels = scales::comma) +
+      labs(x="Year", y="Home Value in Millions($)")
+fig2 <- ggplotly(medianPriceAll2)
+fig <- subplot(fig1, fig2, shareY = TRUE)
+
+fig
+```
+
+
+A rather stagnant Median Cost Price can be inferred from the graph above for the past 2 years. To reduce the complexicity of data in hand, median cost price for year (2017) is chosen to be the actual price of the individual 2 bedroom properties across every regionName(zipcode). Decisions made here on will be based on this assumption.
+&nbsp;
+&nbsp;
+&nbsp;
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+# Choosing the Last One Year Median Price 
+currentMedianPrice <- medianYears %>% filter(year == endYear)
+
+
+ny_formatted_zillow_df <- ny_zillow_df %>% select(ZipCode, RegionID, CountyName, SizeRank) %>%   
+  inner_join(currentMedianPrice, by = "ZipCode")
+ny_formatted_zillow_df <- rename(ny_formatted_zillow_df, Median_home_value = Median)
+ny_formatted_zillow_df$year <- as.numeric(ny_formatted_zillow_df$year )
+pretty_print_table(ny_formatted_zillow_df)
+
+```
+
+
+
+**Get New York's socio-economic variables from the usa.county package.**
+
+The data has FIPS column and not Zip code so the zip codes are gotten from the zip code data and finally merged with the zillow county data.
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+NY_county_data = subset(USA_county_data, ST=="NY")
+
+# Merge Zip code and County data
+NY_ZipCounty_data <- merge(zip_codes, NY_county_data, by="fips")
+
+# Format county variable
+NY_ZipCounty_data$County = sub(" County.*", "", NY_ZipCounty_data$County)
+
+# Select Interested Columns
+NY_ZipCounty_formatted_data <- subset(
+    NY_ZipCounty_data, 
+    select = c(
+        zip, At.Least.High.School.Diploma,At.Least.Bachelor.s.Degree, Graduate.Degree, 
+        Median.Earnings.2010.dollars, Service.occupations, Children.Under.6.Living.in.Poverty, 
+        Management.professional.and.related.occupations, Adults.65.and.Older.Living.in.Poverty, 
+        Poverty.Rate.below.federal.poverty.threshold, White, Black, Hispanic, Asian, Amerindian, 
+        White_Asian, median_age, Sexually.transmitted.infections, Adult.smoking, Unemployment, 
+        Violent.crime, Homicide.rate, Injury.deaths, elevation, annual_PRCP, winter_PRCP, summer_PRCP, 
+        spring_PRCP, autumn_PRCP, annual_TAVG, annual_TMAX, annual_TMIN, winter_TAVG, winter_TMAX, winter_TMIN,
+        summer_TAVG, summer_TMAX, summer_TMIN, spring_TAVG, spring_TMAX, spring_TMIN, autumn_TAVG, autumn_TMAX, 
+        autumn_TMIN
+        ) 
+    )
+NY_ZipCounty_formatted_data <- rename(NY_ZipCounty_formatted_data, ZipCode = zip)
+
+NY_processed_ZipCounty_Data <- merge(ny_formatted_zillow_df, NY_ZipCounty_formatted_data, by="ZipCode")
+NY_processed_ZipCounty_Data <- rename(NY_processed_ZipCounty_Data, zipcode=ZipCode)
+NY_processed_ZipCounty_Data$zipcode <- as.character(NY_processed_ZipCounty_Data$zipcode)
+NY_processed_ZipCounty_Data$RegionID <- as.character(NY_processed_ZipCounty_Data$RegionID)
+NY_processed_ZipCounty_Data$CountyName <- as.character(NY_processed_ZipCounty_Data$CountyName)
+pretty_print_table(NY_processed_ZipCounty_Data)
+```
+
+The dataset has 43 socio-economic variables with information on Education, Poverty, Income, Race breakdown, employment, crime rate and weather variables. 
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+##### Preprocess AirBnB dataset
+
+> Assumptions Made: 
+
+* No significant difference in housing prices in the same neighborhood
+*	The investor will pay for the property in cash (i.e. no mortgage/interest rate will need to be accounted for). 
+*	The time value of money discount rate is 0% (i.e. $1 today is worth the same 100 years from now). 
+*	All properties and all square feet within each locale can be assumed to be homogeneous (i.e. a 1000 square foot property in a locale such as Bronx or Manhattan generates twice the revenue and costs twice as much as any other 500 square foot property within that same locale.) 
+* Occupancy rate of 75% annually
+* 50% of guests review the hosts/listings
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Subset datapoints belonging to the state of New york and 2 bedroom apartments**
+
+```{r, message=FALSE, warning=FALSE}
+airbnb_df_dim = dim(airbnb_df)
+nyAirbnb_df <- subset(airbnb_df, (state == "NY" | state == "New York"))
+nyAirbnb_df <- subset(nyAirbnb_df, (bedrooms==2))
+nyAirbnb_df <- subset(nyAirbnb_df, (price!="$0.00"))
+nyAirbnb_df[nyAirbnb_df=="N/A"] <- NA
+nyAirbnb_df_dim <-dim(nyAirbnb_df)
+```
+
+
+The initial airbnb dataset has `r airbnb_df_dim[1]` rows and `r airbnb_df_dim[2]` columns. After filtering the data for the State of New York, properties with 2 Bedrooms with non-zero price the data was reduced to `r nyAirbnb_df_dim[1]` rows and `r nyAirbnb_df_dim[2]` columns.
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Account for Missing Zipcodes**
+
+Zipcode column contains some missing values. Ignoring these values can prove detrimental to the analysis. Zipcodes are imputed by selecting a non-NA value from Neighbourhood Group Cleansed.
+
+
+```{r}
+noEmptyRows_init <- sum(is.na(nyAirbnb_df$zipcode))
+print(paste("There was initially",noEmptyRows_init, "number of rows with null zipcodes"))
+nyAirbnb_df <- nyAirbnb_df %>% group_by(neighbourhood_group_cleansed) %>% 
+  fill(zipcode) %>% ungroup() 
+noEmptyRows_final <- sum(is.na(nyAirbnb_df$zipcode))
+print(paste("After imputation, there is",noEmptyRows_final, "number of rows with null zipcodes"))
+
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Dollar-ed Price Columns**
+
+‘$’ Value prefix of every price column and '%' suffix of rate columns prevents numeric manipulation. It is thus removed from the corresponding columns
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+
+price_rate_columns <- c("price",	"weekly_price", "monthly_price", "security_deposit", 
+                   "cleaning_fee", "extra_people", "host_response_rate")
+
+nyAirbnb_df[, price_rate_columns] <- as.data.frame(
+  lapply(
+    nyAirbnb_df[, price_rate_columns], 
+    FUN = function(x) as.numeric(gsub('[$,%]','', x))
+    )
+  ) 
+
+pretty_print_table(head(nyAirbnb_df[,price_rate_columns]))
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Creation of more representative variables from of Ammenities column**
+
+We observed that different listings have different amenities and hence we created flag/dummy variables for the most important amenities we thought a user looks for while booking at Airbnb.
+These amenities are TV, Internet, Kitchen, Pets, Breakfast, Gym, Air Conditioning, Pool, Free Street Parking.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# Adding amenities categories
+nyAirbnb_df$host_identity_verified <- ifelse(grepl("t",nyAirbnb_df$host_identity_verified, ignore.case = T)==T,1,0)
+nyAirbnb_df$host_is_superhost <- ifelse(grepl("t",nyAirbnb_df$host_is_superhost, ignore.case = T)==T,1,0)
+
+
+amenities_vector<- c(
+  "TV", "Internet", "Kitchen", "Pets", "Breakfast","Gym", 
+  "Air conditioning", "Pool", "Free street parking"
+  )
+
+
+nyAirbnb_df <- as.data.frame(nyAirbnb_df)
+
+
+nyAirbnb_df <- cbind(nyAirbnb_df, generateNewColumn(nyAirbnb_df, amenities_vector, "amenities"))
+nyAirbnb_df$Pets <- ifelse(grepl("Dog",nyAirbnb_df$amenities, ignore.case = T)==T,1,nyAirbnb_df$Pets)
+nyAirbnb_df$Pets <- ifelse(grepl("Cat",nyAirbnb_df$amenities, ignore.case = T)==T,1,nyAirbnb_df$Pets)
+
+
+pretty_print_table(head(nyAirbnb_df[,gsub(" ", "_",c(amenities_vector))]))
+
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Cleaning the AirBnB Data**
+
+Based on intuition and further inspection I observed that variables such as:    listing_url, scrape_id,	last_scraped,	name,	summary, space, experiences_offered, neighborhood_overview, notes, transit, access, interaction,	house_rules, state, thumbnail_url,	medium_url,	picture_url, xl_picture_url, host_url, host_name, host_since, host_location, host_about, host_acceptance_rate, host_thumbnail_url,	thumbnail_url, host_picture_url, host_neighbourhood, host_listings_count, neighbourhood, host_verifications, host_total_listings_count, host_has_profile_pic, street, market, smart_location,	country_code,	country, is_location_exact, amenities, calendar_updated, maximum_minimum_nights,	minimum_maximum_nights, maximum_maximum_nights, minimum_nights_avg_ntm,	maximum_nights_avg_ntm, has_availability, availability_60, availability_90, calendar_last_scraped, jurisdiction_names, license, review_scores_accuracy, number_of_reviews_ltm, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, requires_license, is_business_travel_ready, require_guest_profile_picture, instant_bookable, calculated_host_listings_count, calculated_host_listings_count_entire_homes, minimum_minimum_nights, calculated_host_listings_count_private_rooms and calculated_host_listings_count_shared_rooms     **may** not add any value to our analysis and should be removed. Hence, we have removed 68 such variables.
+
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+#Removing variables with duplicated values
+#nyAirbnb_df[,names(nyAirbnb_df[(duplicated(t(nyAirbnb_df)))])] <- NULL
+
+# "require_guest_profile_picture", "require_guest_phone_verification"
+unnecessaryVariables <- c(
+    "listing_url", "scrape_id",	"last_scraped",	"name",	"summary", "space", "experiences_offered", 
+    "neighborhood_overview", "notes", "transit", "access", "interaction",	"house_rules", "state",
+    "thumbnail_url",	"medium_url",	"picture_url", "xl_picture_url", "host_url", "host_name", "host_since",
+    "host_location", "host_about", "host_acceptance_rate", "host_thumbnail_url",	"thumbnail_url",
+    "host_picture_url",	"host_neighbourhood", "host_listings_count", "neighbourhood", "host_verifications", 
+    "host_total_listings_count", "host_has_profile_pic",	"street", "market", "smart_location",	"country_code", 
+    "country", "is_location_exact", "amenities", "calendar_updated", "maximum_minimum_nights",	
+    "minimum_maximum_nights", "maximum_maximum_nights", "minimum_nights_avg_ntm",	"maximum_nights_avg_ntm", 
+    "has_availability", "availability_60", "availability_90","calendar_last_scraped", "jurisdiction_names", 
+    "license", "review_scores_accuracy", "number_of_reviews_ltm", "review_scores_cleanliness", 
+    "review_scores_checkin",	"review_scores_communication", "review_scores_location", "review_scores_value",	
+    "requires_license",	"is_business_travel_ready", "require_guest_profile_picture", "instant_bookable",	
+    "calculated_host_listings_count",	"calculated_host_listings_count_entire_homes", "minimum_minimum_nights", 
+    "calculated_host_listings_count_private_rooms",  "calculated_host_listings_count_shared_rooms"
+)
+
+columns.use <- names(nyAirbnb_df)[!(names(nyAirbnb_df) %in% unnecessaryVariables)]
+nyAirbnbFilteredDf <- nyAirbnb_df[,columns.use]
+#pretty_print_table(nyAirbnb_df)
+nyAirbnbFilteredDf_dim <- dim(nyAirbnbFilteredDf)
+```
+
+After removing the variables, the airbnb dataset has `r nyAirbnbFilteredDf_dim[1]` rows and `r nyAirbnbFilteredDf_dim[2]` columns.
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Convert several categorical variables to factor and one hot encoded them**
+
+The host_response_time, host_is_superhost, host_identity_verified, neighbourhood_cleansed, neighbourhood_group_cleansed, property_type, room_type, bed_type, cancellation_policy, require_guest_phone_verification are converted to factors and some of them are encoded to 1 and 0.
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+character_columns <- c("id", "host_id", "city", "zipcode")
+factor_columns <- c(
+  "host_response_time", "host_is_superhost", "host_identity_verified",  
+  "neighbourhood_cleansed", "neighbourhood_group_cleansed", "property_type", 
+  "room_type", "bed_type", "cancellation_policy", "require_guest_phone_verification"  
+  )
+date_columns <- c("last_review", "first_review")
+nyAirbnbFilteredDf[,date_columns[1]] <- as.Date(nyAirbnbFilteredDf[,date_columns[1]])
+nyAirbnbFilteredDf[,date_columns[2]] <- as.Date(nyAirbnbFilteredDf[,date_columns[2]])
+
+nyAirbnbFilteredDf[, character_columns] <- as.data.frame(
+  lapply(
+    nyAirbnbFilteredDf[, character_columns], 
+      FUN <- function(x) {
+        as.character(x)
+      }
+    )
+  ) 
+
+
+nyAirbnbFilteredDf[, factor_columns[c(2,3,10)]] <- as.data.frame(
+  lapply(
+    nyAirbnbFilteredDf[, factor_columns[c(2,3,10)]], 
+      FUN <- function(x) {
+        mode <- calculate_mode(x)
+        x[is.na(x)] <- mode 
+        
+        x <- ifelse(grepl("^t$",x, ignore.case = T)==T,1,x)
+        x <- ifelse(grepl("^f$",x, ignore.case = T)==T,0,x)
+        as.factor(x)
+      }
+    )
+  ) 
+
+pretty_print_table(nyAirbnbFilteredDf[, factor_columns])
+
+```
+
+
+
+**Check if the longitude and latitude values are swapped as well as first review and last review dates**
+Uses the checkLonLat and checkReviewDates functions in the preprocess script to replace the longitude and latitude values if they are swapped as well as the first review and last review dates
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+nyAirbnbFilteredDf <- checkLonLat(nyAirbnbFilteredDf, "id", "longitude", "latitude")
+nyAirbnbFilteredDf <- checkReviewDates(nyAirbnbFilteredDf, "id", "first_review", "last_review")
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Show columns with missing data in decreasing order**
+```{r}
+airbnbMissingValDf <- calcMissingRowPerc(nyAirbnbFilteredDf)
+pretty_print_table(airbnbMissingValDf)
+```
+
+There are about 8 variables with over 20% missing data
+&nbsp;
+&nbsp;
+&nbsp;
+
+##### Merge AirBnB and zillow data for each zipcode
+
+Inner join of New York's AirBnB data and Zillow data had 1,576 rows and 96 columns which led to a loss of 76% of the data so a left join was performed instead. The Zillow housing data and socio-economic data were imputed with the imputeZillowData function found in the Preprocessing file for all zipcodes in the same neighborhood groups. This can introduce a considerable bias in downstream analysis as it dilutes the information in the Zillow dataset but it is a risk worth taking. The resulting data results has no significant loss in the AirBnb listing information. The new and old
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+init_mergedZillowAirbnbData <- merge(nyAirbnbFilteredDf, NY_processed_ZipCounty_Data, by="zipcode")
+dim(init_mergedZillowAirbnbData)
+
+mergedZillowAirbnbData <- merge(nyAirbnbFilteredDf, NY_processed_ZipCounty_Data, by="zipcode",all.x = TRUE)
+reorder_index <- c(2,4,1,10,9,11,51,50,49,12,13,53,3,34,35,5,7,8,14,15,20,37,38,6,16:19,21:33,36,39:48,52,54:96)
+mergedZillowAirbnbData <- mergedZillowAirbnbData[reorder_index]
+
+imputedDf <- as.data.frame(lapply(imputeZillowData(mergedZillowAirbnbData[c(4,5,53:ncol(mergedZillowAirbnbData))]),
+      FUN <- function(x) {
+        x[is.na(x)] <- mean(x, na.rm=TRUE)
+        x
+      }
+    )
+  )
+mergedZillowAirbnbData[c(4,5,53:ncol(mergedZillowAirbnbData))] <- imputedDf
+dim(mergedZillowAirbnbData)
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Drop highly correlated variables, variables with a specified percentage of missing values and variables with near zero variance**
+
+```{r}
+num_dataframe <- mergedZillowAirbnbData[23:ncol(mergedZillowAirbnbData)]
+colnames_list <- colnames(num_dataframe)
+
+
+temp_list <- lapply(colnames_list,convertToNumeric)
+
+# Convert the item with NA to median value from the column
+num_dataframe <- num_dataframe %>% 
+    mutate_all(~ifelse(is.na(.), median(., na.rm = TRUE), .))
+
+# Preprocess the dataframe
+preprocessedNumericDataframe<- preProcessData(num_dataframe, missCutoff=0.20,
+                           dropNearZero=TRUE,
+                           dropCorrVars=TRUE,
+                           corrCutoff=0.95)
+
+processedMergedZillowAirbnbData <- cbind( mergedZillowAirbnbData[1:22], preprocessedNumericDataframe$data)
+#dim(processedMergedZillowAirbnbData)
+```
+
+These results in the removal of 39 variables so the data has been reduced to 57 variables
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Data Exploration
+
+**Number of properties by neighbourhood across property types and room types**
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+p <- ggplot(processedMergedZillowAirbnbData, aes(x = fct_infreq(neighbourhood_group_cleansed), fill = property_type))  + geom_bar() + labs(x = "Neighborhood", y = "Number of Properties", fill="Property Type")  + theme_classic()
+
+ggplotly(p)
+```
+
+
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+p <- ggplot(processedMergedZillowAirbnbData, aes(x = fct_infreq(neighbourhood_group_cleansed), fill = room_type))  + 
+  geom_bar() + 
+  labs(x = "Neighborhood", y = "Number of Properties", fill="Room Type")  + 
+  theme_classic()
+
+ggplotly(p)
+
+```
+
+Brooklyn hosts highest number of properties followed by Manhattan. Queens, Bronx and Staten Island are outliers as far number is concerned. Most of the listings seems to be Apartments and there is a consistent proportion of Property types across the neighborhoods. The proportion of room types is also consistent across the neighborhoods
+&nbsp;
+&nbsp;
+&nbsp;
+
+**How popular has Airbnb become in New York City?**
+
+In this plot, the demand for Airbnb listings in New York City is analyzed using the review dates. I looked at demand over the years since the inception of Airbnb in 2009/2010 and across months of the year to understand seasonlity. I also wish to establish a relation between price and demand. The question I aim to answer is whether prices of listings fluctuate with demand. I will also conduct a more granular analysis to understand how prices vary by days of the week.
+
+To study the demand, since there's no data on the bookings made over the past year, I used ‘number of reviews’ variable as the indicator for demand. As per Airbnb, I assumed about 50% of guests review the hosts/listings, hence studying the number of review will give a good estimation of the demand.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+##NyProcessedAllData %>% group_by(id, total = reviews_per_time_history
+p1 <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$first_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(first_review),"%Y-%m"),"-01",sep=""))) %>% 
+        group_by(timePoint) %>%
+        summarise(unique_listings = sum(number_of_reviews)) %>% 
+        ggplot(aes(x=timePoint, y=unique_listings, group = 1)) +
+          geom_line(color="red") +
+          labs(x="First Review Date", y="Number of Unique Listings", title="Number of Unique Listings Using First & Last Review Date") 
+
+p2 <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$last_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(last_review),"%Y-%m"),"-01",sep=""))) %>% 
+        group_by(timePoint) %>%
+        summarise(unique_listings = sum(number_of_reviews)) %>%
+        ggplot(aes(x=timePoint, y=unique_listings, group = 1)) +
+          geom_line(color="red") +
+          labs(x="Last Review Date", y="Number of Unique Listings")
+
+
+
+fig1 <- ggplotly(p1)
+fig2 <- ggplotly(p2)
+
+fig <- subplot(fig1, fig2, shareY = TRUE, shareX = TRUE)
+fig
+```
+
+Findings: 
+* The number of unique listings receiving reviews has increased over the years. We can see an almost exponential increase in the number of reviews, which indicates an exponential increase in the demand.
+
+* One can observe that number of reviews/demand also depicts a seasonal pattern. Every year there are peaks and drop in the demand, indicating that certain months are busier compared to the others.
+
+Let us look at monthly demands for each of the years between 2016 and 2018. The 2019 listings is not used as it stops in July hence the reason for the dip in the firstgraph.
+&nbsp;
+&nbsp;
+&nbsp;
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+first_review_df <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$first_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(first_review),"%Y-%m"),"-01",sep="")),
+               month = month(timePoint),
+               month = factor(month.abb[month],levels=month.abb),
+               year = year(timePoint)) %>% 
+        group_by(year, month) %>%
+        summarise(unique_listings1 = sum(number_of_reviews)) %>% 
+        filter(year >= 2016) %>%
+        filter(year <= 2018)
+
+last_review_df <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$last_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(last_review),"%Y-%m"),"-01",sep="")),
+               month = month(timePoint),
+               month = factor(month.abb[month],levels=month.abb),
+               year = year(timePoint)) %>% 
+        group_by(year, month) %>%
+        summarise(unique_listings2 = sum(number_of_reviews)) %>% 
+        filter(year >= 2016) %>%
+        filter(year <= 2018)
+
+review_df <- cbind(first_review_df, last_review_df[3]) %>% 
+  mutate(unique_listings = (unique_listings1 + unique_listings2)/2) 
+
+p1 <- review_df[c(1,2,5)] %>% ggplot(aes(x=month, y=unique_listings, group=1)) +
+          geom_line(color="red") +
+          labs(x=" ", y="Number of listings", title="Number of listings receiving reviews across months") +
+          facet_wrap(~year, scales="free") +
+          theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggplotly(p1)
+```
+
+The three graphs reflects the number of reviews monthly across 3 years, which as per my assumption reflects the demand. There seems to be a consistent pattern in how demand fluctuates between 2017 and 2018 the year, which is reflected in each of the graphs shown above. The demand is lowest in January/February and increases until April/May then decreases until June/July and increases for about a month and experiences a large dip in October then it begins to falls until the end of the year.
+
+The increase towards the end of the year can possibly be due to the holiday season kicking in, with people travelling to celebrate Thanksgiving and Christmas at families, leading to an inrease in tourism and hence the demand for tourist lodging. To confirm these findings, data from the National Tourism and Travel Office (NTTO) website can be surveyed to observe a similar pattern in number of non-resident arrivals to the US (NYC as the port of entry) across the year. 
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+first_review_df <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$first_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(first_review),"%Y-%m"),"-01",sep="")),
+               month = month(timePoint),
+               month = factor(month.abb[month],levels=month.abb),
+               year = year(timePoint)) %>% 
+        group_by(year, month) %>%
+        summarise(avg_price1= mean(price, na.rm=TRUE)) %>% 
+        filter(year >= 2016) %>%
+        filter(year <= 2018)
+
+last_review_df <- processedMergedZillowAirbnbData[!is.na(processedMergedZillowAirbnbData$last_review), ] %>% 
+        mutate(timePoint = as.Date(paste(format(as.Date(last_review),"%Y-%m"),"-01",sep="")),
+               month = month(timePoint),
+               month = factor(month.abb[month],levels=month.abb),
+               year = year(timePoint)) %>% 
+        group_by(year, month) %>%
+        summarise(avg_price2= mean(price, na.rm=TRUE)) %>% 
+        filter(year >= 2016) %>%
+        filter(year <= 2018)
+
+review_df <- cbind(first_review_df, last_review_df[3]) %>% 
+  mutate(avg_price = (avg_price1 + avg_price2)/2) 
+
+p2 <- review_df[c(1,2,5)] %>% ggplot(aes(x=month, y=avg_price, group=1)) +
+          geom_line(color="red") +
+          labs(x="Review Date", y="Price ($)", title="Average price across months") +
+          facet_wrap(~year, scales="free") +
+          theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#grid.arrange(p1, p2, nrow = 2)
+ggplotly(p2)
+
+```
+
+
+After observing the pattern in the demand, I investigated whether the prices of the listings follow a similar pattern. To answer the above question, I looked at the daily average prices of the listings acoss the years.
+
+The 2016 and 2018 trends for the price is similar. It is lowest in February and increases until April/May then decreases until June/July and increases for about a month and experiences a large dip in October then it begins to falls until the end of the year. The pattern is similar to that of the number of reviews/demand. This seems counter-intuitive as one would expect the price to decrease with a decrease in demand. This could possibly due to the assumption that I made that number of reviews is a reflection of the demand, which might not always be the case.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Feature Engineering
+
+The following variables are created to combine the variance in certain variables and reduce the dimension of the data.
+
+*  n.distance => distance to closest neighbor
+*  radius50 => how many listings are in within a 50km radius 
+*  bedrooms_per_person => number of bedrooms divided by how many people it accomodates
+*  bathrooms_per_person => number of bathrooms divided by how many people it accomodates
+*  stay_duration => maximum number of nights allowed minus minimum number of nights allowed
+*  percent_extra_per_guest_included => Percentage of price that's charged for extra people divided by the number of guests allowed
+*  reviews_per_time_history => number of reviews divided by the total days available in entire time history of listing
+*  revenue_per_year => yearly revenue assuming a 75% occupancy rate
+*  break_even_years => number of years till the listing starts profiting
+*  earnings_5y => amount of money earned in 5 years
+*  earnings_10y => amount of money earned in 10 years
+*  earnings_20y => amount of money earned in 20 years
+*  percent_return_5y => percentage of investment made in 5 years
+*  percent_return_10y => percentage of investment made in 10 years
+*  percent_return_20y => percentage of investment made in 20 years
+
+Some of the columns used in creating these variables are removed from the dataset to prevent collinearity
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+processedMergedZillowAirbnbData <- calculateIsolationVariables(processedMergedZillowAirbnbData,
+                                                               "longitude",
+                                                               "latitude")
+processedMergedZillowAirbnbData <- processedMergedZillowAirbnbData[c(1:9,58,59,10:57,60,61)]
+
+processedMergedZillowAirbnbData <- mutate(
+  processedMergedZillowAirbnbData, 
+    bedrooms_per_person = round(beds/accommodates,2),
+    bathrooms_per_person = round(bathrooms/accommodates,2),
+    stay_duration = (maximum_nights - minimum_nights),
+    percent_extra_per_guest_included = round(((extra_people/price)/guests_included)*100,2),
+    reviews_per_time_history = round(
+      number_of_reviews/((as.numeric(last_review - first_review)/365)*availability_365)
+      ,2),
+    revenue_per_year = round(price*365*.75),
+    break_even_years = round(Median_home_value/revenue_per_year), 
+    earnings_5y = round(revenue_per_year*5 - Median_home_value),
+    earnings_10y = round(revenue_per_year*10 - Median_home_value),
+    earnings_20y = round(revenue_per_year*20 - Median_home_value),
+    percent_return_5y = round((revenue_per_year*5 - Median_home_value)/Median_home_value * 100,2),
+    percent_return_10y = round((revenue_per_year*10 - Median_home_value)/Median_home_value * 100,2),
+    percent_return_20y = round((revenue_per_year*20 - Median_home_value)/Median_home_value * 100,2)
+)
+
+processedMergedZillowAirbnbData <- do.call(
+  data.frame,lapply(processedMergedZillowAirbnbData, function(x) replace(x, is.infinite(x),NA))
+)
+
+unnecessaryVariables <- c("bedrooms", "bathrooms", "accomodates", "maximum_nights", "minimum_nights",
+                          "extra_people", "last_review", "first_review", "bed", "availability_30", "SizeRank",
+                          "year", "RegionID", "CountyName", "property")
+columns.use <- names(processedMergedZillowAirbnbData)[!(names(processedMergedZillowAirbnbData) %in% unnecessaryVariables)]
+processedMergedZillowAirbnbData <- processedMergedZillowAirbnbData[,columns.use]
+pretty_print_table(processedMergedZillowAirbnbData[c("bedrooms_per_person", "bathrooms_per_person", "stay_duration", "reviews_per_time_history", "percent_extra_per_guest_included", "revenue_per_year", "break_even_years", "earnings_5y", "earnings_10y", "earnings_20y", "percent_return_5y", "percent_return_10y", "percent_return_20y")])
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+**Get percentage of dataset profitable in 5 years, 10 years and 20 years**
+```{r}
+profit_df<- cbind(
+  as.data.frame(table(processedMergedZillowAirbnbData$percent_return_5y > 0)),
+  as.data.frame(table(processedMergedZillowAirbnbData$percent_return_10y > 0))[2],
+  as.data.frame(table(processedMergedZillowAirbnbData$percent_return_20y > 0))[2]
+) 
+names(profit_df) <- c("Profitable", "5_years", "10_years", "20_years")
+profit_df[2:4] <-round((profit_df[2:4]/nrow(processedMergedZillowAirbnbData))*100,2)
+pretty_print_table(profit_df)
+```
+
+The 20 years return will be used for the rest of the analysis as it contains about 36% of the profitable listings in the dataset. The 5 years or 10 years estimate can be used if the company is interested in making profit as quick as possible.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**Statistical approach to reduce the dimensionality of the data using ANOVA**
+
+One-way Analysis of variance of the percent_return_20y variable with several variables is performed to determine what variables account for its variance. A variable called 'significant' is created which is 'YES' is the p-value is less than 0.025 and 'NO' otherwise.
+
+```{r}
+selected_columns <- names(processedMergedZillowAirbnbData)[c(12:20,22:(ncol(processedMergedZillowAirbnbData)-8))]
+anova_list <-lapply(selected_columns, 
+                    getAnovaParameters, 
+                    df=processedMergedZillowAirbnbData, 
+                    target_column="percent_return_20y")
+nyAnovaDf <- do.call("rbind", anova_list)
+nyAnovaDf <- arrange(nyAnovaDf, p.value)
+nyAnovaDf$significant <- ifelse(nyAnovaDf$p.value < 0.025, "Yes", "No")
+nyAnovaDf
+```
+
+Based on the p-values gotten from the One-Way ANOVA, we can say that weather, demographics, home value, distance to nearest neighbor and crime rate significantly impact the ROI. Several variables including Cancellation policies, Breakfast and host response time does not. 
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**Retain only the Statistically Significant variables**
+
+```{r}
+significant_variables <- subset(nyAnovaDf, significant == "Yes")$term
+significant_variables_index <- which(names(processedMergedZillowAirbnbData) %in% significant_variables)
+NyProcessedAllData <- cbind(
+  processedMergedZillowAirbnbData[1:11],
+  processedMergedZillowAirbnbData[significant_variables_index],
+  processedMergedZillowAirbnbData["price"],
+  processedMergedZillowAirbnbData[56:ncol(processedMergedZillowAirbnbData)]
+  )
+dim(NyProcessedAllData)
+```
+
+This results in the removal of 29 variables and the resulting dataframe has 6,493 rows and 49 columns. The description column
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**Group the data by Zip Code and Neigborhood to compare listings across New York by Zip Code**
+
+```{r}
+## One-Hot encoding of the room_type and property_type variables
+room_type_vector<- unique(NyProcessedAllData$room_type)
+property_type_vector<- unique(NyProcessedAllData$property_type)
+NyProcessedAllData$cancellation_policy[is.na(NyProcessedAllData$cancellation_policy)] <- calculate_mode(NyProcessedAllData$cancellation_policy)
+cancellation_policy_vector<- unique(nyAirbnb_df$cancellation_policy)
+
+
+
+categorical_df <- as.data.frame(cbind(
+  generateNewColumn(NyProcessedAllData, room_type_vector, "room_type"),
+  generateNewColumn(NyProcessedAllData, property_type_vector, "property_type")
+))
+
+## Preprocess to guard for high correlation between them
+encoded_df <- preProcessData(categorical_df, missCutoff=0.20,
+                           dropNearZero=TRUE,
+                           dropCorrVars=FALSE,
+                           corrCutoff=0.95)$data
+
+NyProcessedAllData <- cbind(NyProcessedAllData[1:12], encoded_df, NyProcessedAllData[15:ncol(NyProcessedAllData)])
+
+undesired_variables <- c("room_type", "property_type", "city", "SizeRank")
+columns.use <- names(NyProcessedAllData)[!(names(NyProcessedAllData) %in% undesired_variables)]
+NyProcessedAllData <- NyProcessedAllData[,columns.use]
+
+
+names(NyProcessedAllData)[12] <- "Entire_home_apt"
+neighbourhood_group_cleansed <- as.character(NyProcessedAllData$neighbourhood_group_cleansed)
+
+NyProcessedAllData$zipcode <- as.character(NyProcessedAllData$zipcode)
+groupedNyData <- NyProcessedAllData[c(3,4,8,9,11:ncol(NyProcessedAllData))]  %>% mutate_all(~ifelse(
+  as.numeric(.), as.numeric(.), .)
+  ) 
+
+## Perform grouby
+groupedNyData$neighbourhood_group_cleansed <- neighbourhood_group_cleansed
+groupedNyData <- groupedNyData %>% group_by(neighbourhood_group_cleansed, zipcode) %>% summarise(
+    latitude = mean(latitude, na.rm=TRUE),
+    longitude = mean(longitude, na.rm=TRUE),
+    no_of_listings = n(),
+    sum_host_identity_verified = sum(host_identity_verified,na.rm=TRUE),
+    avg_accommodates = mean(accommodates, na.rm=TRUE),
+    sum_Entire_home_apt = sum(Entire_home_apt,na.rm=TRUE),
+    sum_Private_room = sum(Private_room, na.rm = TRUE),
+    sum_Apartment = sum(Apartment, na.rm = TRUE),
+    sum_Condominium = sum(Condominium, na.rm = TRUE),
+    sum_House = sum(House, na.rm = TRUE),
+    avg_availability_365 = mean(availability_365, na.rm=TRUE),
+    avg_number_of_reviews = mean(number_of_reviews, na.rm=TRUE),
+    avg_review_scores_rating = mean(review_scores_rating, na.rm=TRUE),
+    sum_TV = sum(TV, na.rm = TRUE),
+    sum_Gym = sum(Gym, na.rm = TRUE),
+    avg_neighbor_distance = mean(n.distance, na.rm = TRUE),
+    avg_neighbor_radius50 = mean(radius50, na.rm = TRUE),
+    median_home_value = median(Median_home_value, na.rm = TRUE),
+    avg_White = mean(White, na.rm = TRUE),
+    avg_Asian = mean(Asian, na.rm = TRUE),
+    avg_Amerindian = mean(Amerindian, na.rm = TRUE),
+    avg_Sexually.transmitted.infections = mean(Sexually.transmitted.infections, na.rm = TRUE),
+    avg_Violent.crime = mean(Violent.crime, na.rm = TRUE),
+    avg_Injury.deaths = mean(Injury.deaths, na.rm = TRUE),
+    avg_winter_PRCP = mean(winter_PRCP, na.rm = TRUE),
+    avg_spring_PRCP = mean(spring_PRCP, na.rm = TRUE),
+    avg_autumn_TAVG = mean(autumn_TAVG, na.rm = TRUE),
+    avg_percent_extra_per_guest_included = mean(percent_extra_per_guest_included, na.rm = TRUE),
+    avg_reviews_per_time_history = mean(reviews_per_time_history, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    avg_revenue_per_year = mean(revenue_per_year, na.rm = TRUE),
+    avg_break_even_years = mean(break_even_years, na.rm = TRUE),
+    avg_earnings_20y = mean(earnings_20y, na.rm = TRUE),
+    avg_percent_return_20y = mean(percent_return_20y, na.rm = TRUE)
+)
+  
+groupedNyData <- groupedNyData[!duplicated(groupedNyData$zipcode),]
+groupedNyData <- cbind(groupedNyData[1:4],round(groupedNyData[5:ncol(groupedNyData)]))
+groupedNyData$avg_reviews_per_time_history <- NULL
+pretty_print_table(groupedNyData)
+```
+
+The grouping results in 169 rows representing unique zipcodes, there are 27 variables that are statistically significant and uncorrelated with the price excluding the break even years, 20 years earnings and 20 years percentage return parameters.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Further Data Exploration
+
+**Number of properties and yearly availability by Zipcode**
+
+The top 50 zipcodes with the highest listings are derived and plotted in the charts below as well as their yearly availabilities.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+NyProcessedAllData$zipcode <- as.factor(NyProcessedAllData$zipcode)
+
+## Group the data by zip code, calculate the number of listings in each zipcode and order it (desc)
+orderedNyProcessedAllData <- NyProcessedAllData %>%
+    group_by(neighbourhood_group_cleansed, zipcode) %>%                              # calculate the counts
+    summarize(counts = n()) %>%
+    arrange(-counts) %>%                                # sort by counts
+    mutate(zipcode = factor(zipcode, zipcode))        # reset factor
+
+## Group the data by zip code, calculate the average availablityyearly for each zipcode and order it (desc)
+orderedAvailNyProcessedAllData <- NyProcessedAllData %>%
+    group_by(neighbourhood_group_cleansed, zipcode) %>%                              # calculate the counts
+    summarize(availability_365 = round(mean(availability_365))) %>%
+    arrange(-availability_365) %>%                                # sort by counts
+    mutate(zipcode = factor(zipcode, zipcode)) 
+
+## Merge the availability and listings dataset and order it based on availability
+mergedOrderedNyProcessedAllData <- merge(orderedAvailNyProcessedAllData, orderedNyProcessedAllData)
+mergedOrderedNyProcessedAllData <- arrange(mergedOrderedNyProcessedAllData, desc(counts)) 
+
+## Display first bar chart showing 40 zipcodes with highest listings in decreasing order
+p1 <- head(mergedOrderedNyProcessedAllData,50) %>%   
+    ggplot(aes(x=reorder(zipcode, -counts), y=counts, fill=neighbourhood_group_cleansed)) +  
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + theme_bw() +
+      geom_bar(stat="identity") + 
+      theme(plot.background = element_blank(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            axis.text.x = element_text(angle = 90, hjust = 1)) +
+      labs(y="Number of Listings", 
+           x=" ", 
+           fill="Neighborhood", 
+           title="Bar Chart showing Number of Listings & Yearly Availability by Zip Code") 
+
+## Display second bar chart showing the yearly availability of the 40 zipcodes with highest number of listings
+p2 <- head(mergedOrderedNyProcessedAllData,50) %>%   
+    ggplot(aes(x=reorder(zipcode, -counts), y=availability_365, fill=neighbourhood_group_cleansed)) +  
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      theme_bw() +
+      geom_bar(stat="identity") + 
+      theme(plot.background = element_blank(),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            axis.text.x = element_text(angle = 90, hjust = 1)) +
+      labs(y="Yearly Availability", 
+           x="Zip Code", 
+           fill="Neighborhood")
+
+ggarrange(p1, p2, nrow = 2)
+
+```
+
+Brooklyn, Manhattan and Queens are the neighborhoods with the greatest number of listings, Brooklyn being the highest followed by Manhattan then Brooklyn. From intuition, the higher the number of listings, the higher the number of choices reassuring higher airbnb rental activity in the area. Zipcodes with very high number of listings seems to have low availability across the year showing a demand-supply elasticity. This trend seems to be clearer in Manhattan and Queens neighborhood compared to Brooklyn
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+
+**Nightly Price by Neighbourhood**
+
+Beyond investment, a company would look foward to make money as fast as possible. The higher the rental price, the faster is the ROI and profits. Also, the more spread out the price is, the more flexibility the company has to make money. 
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+pricebynbghrhood <- ggplot(groupedNyData,aes(x=avg_price, fill=neighbourhood_group_cleansed)) + 
+                      geom_density(alpha = 0.6) + 
+                      scale_x_continuous(limits = quantile(groupedNyData$avg_price, c(0, 0.99))) + 
+                      labs(x = "Price/Night", y = "Density", title="Distribution of Price by Neighborhood") + 
+                      guides(fill = guide_legend(title = "Neighbourhood")) 
+
+ggplotly(pricebynbghrhood) 
+```
+
+A general look at spread of price/Night across the neighborhoods reveals that:
+
+* Manhattan has a wider spread with price ranging from $50 to about $1130 per night.
+* Brooklyn and Staten Island seems to have a bell curve showing characterstics of normal real world behaviour.
+* Brooklyn, Staten Island, Queens and Bronx have lower prices and narrower distribution.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**Map Showing Properties locations by price and percentage returned**
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+groupedNyData$price_bin <- ifelse(scores(groupedNyData$avg_price) > 0.04, "High Price", 
+                                  ifelse(scores(groupedNyData$avg_price) <= 0.04 & scores(groupedNyData$avg_price) >= -0.25, 
+                                         "Medium Price", "Low Price"))
+groupedNyData$colors <- factor(groupedNyData$price_bin, 
+                    levels = c("Low Price", "Medium Price", "High Price"))
+
+cols <- c("red", "yellow", "green")
+
+p <- groupedNyData %>%
+  plot_mapbox(lat = ~latitude, lon = ~longitude, size=2,
+              mode = 'scattermapbox',
+              text=~paste(' Zip Code: ', groupedNyData$zipcode,
+                      '</br> Neighborhood: ', groupedNyData$neighbourhood_group_cleansed,
+                      '</br> Years till break even: ', groupedNyData$avg_break_even_years,
+                      '</br> Cumulative Income in shown years: ', groupedNyData$avg_revenue_per_year*groupedNyData$avg_break_even_years,
+                      '</br> Number of reviews: ', groupedNyData$avg_number_of_reviews,
+                      '</br> Cost: ', groupedNyData$median_home_value)) %>%
+  layout(title = 'New York Airbnb Listing by Price and 20 Years % Returned',
+         font = list(color='white'),
+         plot_bgcolor = '#191A1A', paper_bgcolor = '#191A1A',
+         mapbox = list(style = 'dark',
+                       zoom = 9,
+                       center = list(lat = median(groupedNyData$latitude),
+                                     lon = median(groupedNyData$longitude))),
+         legend = list(orientation = 'h',
+                       font = list(size = 8),
+                       itemsizing="constant"),
+         margin = list(l = 25, r = 25,
+                       b = 25, t = 25,
+                       pad = 2))  %>% add_markers(
+    x = ~latitude, y = ~longitude, color = ~colors, colors = cols, marker = list(size = ~avg_percent_return_20y))
+  
+p
+
+```
+
+The colors in the maps represents the price bins while the size of the markers represents the ROI percentage of the investment in 20 years. Clusters around Manhattan, Queens and Brooklyn are associated majorly with properties with high prices and high 20 years ROI. This can be due to proximity to popular locations like One World Trade Center, Museum of Modern Art, Empire State Building, Columbia University to mention a few. Geographical location seems to be the greatest driving factor of the price and the return.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Analysis to Determine Factors that drive the variance of the 20 Years Percentage Return Variable
+
+**Linear Regression and LASSO Regression of the ROI**
+
+Two simple models are used to determine variables with strongest predictive power of the 20 years percentage ROI, the results is shown below.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+## LASSO Regression
+X <- as.matrix(groupedNyData[4:31])
+Y <- as.matrix(groupedNyData$avg_percent_return_20y)
+l1BetasParams <- lasso_model(X,Y)
+l1Betas1 <- l1BetasParams$df
+
+## Linear Regression
+tempDf <- as.data.frame(lm(Y~X)$coef)
+tempDf$VarID <- rownames(tempDf)
+rownames(tempDf) <- NULL
+tempDf <- tempDf[,c(2,1)]
+names(tempDf) <- c("VarID", "beta")
+tempDf <- tempDf[c(2:nrow(tempDf)),]
+tempDf$VarID <-gsub("X", "",tempDf$VarID)
+l1Betas2 <- tempDf
+
+## LASSO Regression plot
+l1BetasPlot1 <-
+  ggplot(l1Betas1, aes(x=VarID, y=beta))+
+  theme(axis.text.x= element_text(angle = 0, hjust = 1))+
+  geom_hline(yintercept=0, lwd=.5, lty=3) +
+  geom_segment(aes(x=l1Betas1$VarID, xend=l1Betas1$VarID,
+                   y=0, yend=l1Betas1$beta), colour="red", lwd=.4)+
+  geom_point(color="darkred")+
+  labs(x = "LASSO Regression", y = "Regression Coefficient", title="Regression Plots of AirBnB and Zillow Data") +
+  theme(strip.text.y = element_text(angle=0)) +
+  theme(plot.margin = unit(c(1,2,1,2), "cm")) +
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+## Linear regression plot
+l1BetasPlot2 <-
+  ggplot(l1Betas2, aes(x=VarID, y=beta))+
+  theme(axis.text.x= element_text(angle = 0, hjust = 1))+
+  geom_hline(yintercept=0, lwd=.5, lty=3) +
+  geom_segment(aes(x=l1Betas2$VarID, xend=l1Betas2$VarID,
+                   y=0, yend=l1Betas2$beta), colour="red", lwd=.4)+
+  geom_point(color="darkred")+
+  labs(x = "Linear Regression", y = "Regression Coefficient") +
+  theme(strip.text.y = element_text(angle=0)) +
+  theme(plot.margin = unit(c(1,2,1,2), "cm")) +
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1))
+ 
+fig1 <- plotly::ggplotly(l1BetasPlot1)
+fig2 <- plotly::ggplotly(l1BetasPlot2)
+
+fig <- subplot(fig2, fig1)
+
+fig
+```
+
+Both models give R-Square of 0.88. Percentage of Asian population, autumn average temperature, winter precipitation is common in both models. Extra variables like STI rate, crime rate, median home value appears to also be important parameters in the linear regression models.  Beta-values that are positive have positive effects on the 20 years percentage ROI (considering other variables are fixed) and vice versa.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+
+**Association analysis using PCA and GG-Biplot**
+
+The arrows in the plot represents each variable and arrows that are close together have high correlation between them. Arrows on the right side of PC1 and upper part of PC2 are positively correlated with them and vice versa.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+set.seed(1)
+
+data <- groupedNyData[c(5,7,9,10,12:16,18:22,24:31,35)]
+
+## Rename columns in dataframe
+names(data) <- c(
+  "   Listings_num", "Accommodates", "Private_room", "Apartment", "House", "Availability_365", "Reviews_Num", 
+  "Rating", "TV", "Neighbor_Dist", "Neighbor_radius50", "Home Value", "White", "Asian", "Sexual Infections", "Crime",
+  "Injury/Death",  "Winter_PRCP", "Spring_PRCP", "Autumn_TAVG", "Extra_guest_percentage", "Price", "Percent_Return"
+)
+
+# PCA
+pc <- prcomp(data[,-23],
+             center = TRUE,
+             scale. = TRUE)
+
+# GG-Biplot
+g <- ggbiplot(pc, 
+              obs.scale = 1, 
+              var.scale = 1,   
+              groups = ifelse(data$Percent_Return > 50, "High Return", 
+                              ifelse(data$Percent_Return <= 50 & data$Percent_Return >= 0, 
+                                     "Medium/No Return", "Negative Return")),
+              ellipse = TRUE, 
+              circle = TRUE,
+              ellipse.prob = 0.68)
+
+g <- g + scale_color_discrete(name = '')
+g <- g + theme(legend.direction = 'horizontal', 
+               legend.position = 'top')
+
+print(g)
+
+```
+
+The first two Principal Components explains 45% of the overall variability in the dataset. The 20 years ROI percentage are color coded with red representing zipcodes with over 50% return, green representing zipcodes between 0 to 50% return and blue representing zipcodes that have no return. 
+
+A clear seperation can be seen among most of the zip zodes associated with high 20 years percentage return. Those zipcodes have high Asian demographic, low Sexual Infections Rate, low Autumn TAVG, low home values, low Precipitation in spring and winter and low crime rates to mention a few. 
+
+These results is similar to the results from the regression models and can be helpful to further pin point the location of the properties to buy withing a particular Zip Code and neighborhood
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+
+> Investment Analysis
+
+**Break Even Years and Revenue Trade-Off Chart**
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+p1 <- ggplot(data = groupedNyData, aes(x=avg_break_even_years, y=avg_revenue_per_year)) +
+        geom_point(aes(size=no_of_listings,
+                       shape=neighbourhood_group_cleansed,
+                       color=median_home_value,
+                       group=neighbourhood_group_cleansed),
+                   alpha = 0.8) +
+        yscale("log10", .format = TRUE) +
+        labs(x="Break Even Years",
+             y="Revenue ($)/Year",
+             shape="Neighborhood",
+             title="ROI Chart",
+             size="No. of Listings",
+             color="Median Home Value ($)") +
+        scale_color_viridis(option = "B") +
+        theme(plot.title = element_text(hjust = 0.5),
+          strip.text.x = element_text(size = 9, color = "black", face = "bold.italic"),
+          strip.text.y = element_text(size = 9, color = "black", face = "bold.italic"),
+          strip.background = element_rect(
+            fill="lightblue",
+            size=1,
+            color="darkblue",
+            linetype="solid"))
+
+p1
+```
+
+From the chart above the yearly revenue seems to go down as the break even years increases across all neighborhoods. Most of the properties in Manhattan, Brooklyn and Bronx seems to have a good Revenue-Break Even tradeoff and they are considerably more expensive with more number of properties.
+
+If short term investments i.e  low break even with low investment cost was the major investment criteria then ideal location to be is the bottom-left quadrant of the chart. Most properties with lower home value have the quickest break even time, these properties are also majorly in Queen and a few from Staten Island.
+
+If short term investments with mid to high investment cost was the major investment criteria then ideal location to be is the mid-left quadrant of the chart. Most properties with medium to high home value have slightly longer break even time, these properties are also majorly in Manhattan, Brooklyn and Bronx.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+
+**Top 10 zipcodes by individual Metrics **
+
+Five metrics are finally used to pin point the zip code to invest in with the champion Zip Code being the zipcode with highest frequency overall. The metrics used are 20 years ROI percentage, Initial investment i.e home value, break even years, yearly availability and review rating. The ideal Zip Code should have high return, low investment, quick break even, high review and low availability as it should be booked year round. The zip codes are sorted according to these metrics and the top ten Zip codes is displayed below
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+topPercentReturn <- head(arrange(groupedNyData, desc(avg_percent_return_20y)),10)[,"zipcode"]
+names(topPercentReturn) <- "20 years Return" 
+topHomeValue <- head(arrange(groupedNyData, median_home_value),10)[,"zipcode"]
+names(topHomeValue) <- "Initial Investment" 
+topBreakEven <- head(arrange(groupedNyData, avg_break_even_years),10)[,"zipcode"]
+names(topBreakEven) <- "Break Even Years"
+topOccupancy <- head(arrange(groupedNyData, avg_availability_365),10)[,"zipcode"]
+names(topOccupancy) <- "Availability" 
+topReviewRating <- head(arrange(groupedNyData, desc(avg_review_scores_rating)),10)[,"zipcode"]
+names(topReviewRating) <- "Review Rating" 
+
+investmentDf <- cbind(topPercentReturn, topHomeValue, topBreakEven, topOccupancy, topReviewRating)
+pretty_print_table(investmentDf)
+```
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+**Top zipcodes fitting two or more metrics **
+
+Zipcodes that managed to make it to 2 or more metrics are filtered and arranged in  descending order.
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# pre-allocate a list and fill it with a loop
+investmentDf.list <- vector("list", nrow(investmentDf))
+
+investmentDf.list <- as.list(as.data.frame(investmentDf))
+investmentDf.vector <- unlist(investmentDf.list)
+unique.zip <- table(investmentDf.vector)
+unique.zip.df <- as.data.frame(sort(unique.zip, decreasing = TRUE))
+names(unique.zip.df) <- c("Zip Code", "Frequency")
+formatted.unique.zip.df <- unique.zip.df[unique.zip.df$Frequency > 1,]
+neighborhood.unique.zip.df <-merge(groupedNyData[1:2], formatted.unique.zip.df, by.x="zipcode", by.y="Zip Code")
+arrange(neighborhood.unique.zip.df, desc(Frequency))
+```
+
+There are 8 zipcodes matching 2 or 8 criterias with the top three belonging to Queens neighborhood. Any of the 3 Zip codes in the Queens neighborhood will be a good Zip Code to invest.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Final Conclusion 
+
+The purpose of this exercise was to build out a data product and provide conclusions to help them understand which zip codes would generate the most profit on short term rentals within New York City. 
+
+Going through the process, I ended up seeing shortcomings in the data - I had to filter out the data and noted some inconsistencies. For example, data indicating a price of “0” could mean either a price of 0, or an absence of the price (which is usually the case for new properties). As such, I chose to consider only prices above a certain cutoff, in order to minimize the impact on the analysis.
+
+I was able to identify some variables not included in the data which could have been significant: for example, Asian Population Rate, Crime Rate, Winter Precipitation. Other elements with too many missing values were also overlooked in the data, such as the size (Sq-Ft) of the lodging.
+
+*  Zipcode 11101, 11357 and 11361 from Queens is the top zipcode as it fits all the 3 of the 5 key metrics.
+
+*  Within the zipcode there are a lot of variations like crime rate and properties that cost much lower than. Given the number of choice is high - the company can further drill into these using results from the factor analysis.
+
+*  The company can also look outside of Queens and look at Manhattan and Bronx to grab some of the properties there. This would give the company a certain coverage across the New York City.
+&nbsp;
+&nbsp;
+&nbsp;
+
+
+> Future Steps
+
+* New York hosts 176 zipcodes, data can be further enriched to account for rest of the zipcodes. 
+
+* An econometric matching model to estimate bookings by market as a function of supply and demand in that market can be built. The "nights booked" can be estimated from demand, supply and their elasticities. Using historical supply (nights available to book) and demand (number of searchers), we can estimate the elasticities using the model. With the fitted model and future forecasts for supply and demand, we can predict the marginal returns in bookings of adding an additional supply to the market. Finally, the marginal returns of supply can help us to determine which market has the highest marginal returns, and we can prioritize our acquisition efforts accordingly.
+
+* Cost and price comparision would yield one-dimensional results. Introduce Math and calculate ROI using individual metrics defined. Since various factor define profitablity.
+
+* Text Analytics / Sentiment Analytics on ignored Description columns from Revenue Data (Airbnb). This would open insights about other metrics that drive customer to book an airbnb property for rental such as Access to Public Transport, parking space etc.
+
+* Introduce Seasonality and Weather data to understand trends occupancy throughout the year. Can be further extended to statistical models to estimate occupancy.
+
+* Finally, due to time constraints - some of the coding practices such as memory management, variable nomenclature and other markdown specific functionalities were ignored. This would be automatic first step in the future scope of work.
+
